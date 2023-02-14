@@ -246,7 +246,7 @@ pub trait BlockingQueue {
     fn pop(&self) -> Self::Item;
 }
 
-const SLEEP_MILLES: u64 = 1000000000;
+const SLEEP_MILLES: u64 = 1000;
 
 impl<T> BlockingQueue for Bbq<T> {
     type Item = T;
