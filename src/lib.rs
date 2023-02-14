@@ -80,7 +80,7 @@ impl<T> Drop for Block<T> {
 }
 
 /// The cursor inside is a usize, indicating version + offset,
-/// with the version being stored in the last two bits.
+/// with the version being stored in the first two bits.
 #[derive(Debug)]
 struct Cursor {
     inner: AtomicUsize,
