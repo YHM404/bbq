@@ -1,9 +1,12 @@
 #![feature(allocator_api)]
+#![feature(ptr_as_uninit)]
+
 mod error;
+use error::ErrorContext;
 pub use error::Result;
-use error::{BlockState, ErrorContext, QueueState};
 use std::{
     alloc::{Allocator, Global, Layout},
+    fmt::Debug,
     ops::Deref,
     ptr::{self, NonNull},
     sync::{atomic::AtomicUsize, Arc},
@@ -13,6 +16,31 @@ use std::{
 
 const VSN_BIT_LEN: usize = 16;
 const OFFSET_BIT_LEN: usize = usize::BITS as usize - VSN_BIT_LEN;
+
+enum EnqueueState<T> {
+    Full(T),
+    Busy(T),
+    Available,
+}
+
+enum DequeueState<T> {
+    Empty,
+    Busy,
+    Ok(T),
+}
+
+enum PBlockState {
+    Available,
+    NoEntry,
+    NotAvailable,
+}
+
+enum CBlockState<T> {
+    BlockDone,
+    Consumed(T),
+    NoEntry,
+    NotAvailable,
+}
 
 #[derive(Debug)]
 struct Block<T> {
@@ -48,23 +76,71 @@ impl<T> Block<T> {
             return Ok(None);
         }
 
-        let old = self
+        let old_allocated_cursor_raw = self
             .allocated_cursor
             .inner
-            .fetch_add(1 << OFFSET_BIT_LEN, std::sync::atomic::Ordering::SeqCst);
-        let old_cursor = Cursor::offset(old);
-        if old_cursor >= self.size {
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let old_allocated_cursor_offset = Cursor::offset(old_allocated_cursor_raw);
+        if old_allocated_cursor_offset >= self.size {
             return Ok(None);
         }
 
         let entry_ref = unsafe {
             self.entries
                 .as_ptr()
-                .add(old_cursor)
+                .add(old_allocated_cursor_offset)
                 .as_mut()
                 .with_context(|| "entry ptr is null")?
         };
         Ok(Some(entry_ref))
+    }
+
+    /// Try to reserved an entry in this Block.
+    ///
+    /// return the offset of reserved if it success.
+    fn try_consume_entry(&self) -> Result<CBlockState<T>> {
+        loop {
+            let reserved_raw = self.reserved_cursor.as_raw();
+            // all spaces had been reserved by others consumer.
+            if Cursor::offset(reserved_raw) >= self.size {
+                return Ok(CBlockState::BlockDone);
+            }
+
+            let committed_raw = self.committed_cursor.as_raw();
+            // means that there have no space to reserved.
+            if Cursor::offset(reserved_raw) == Cursor::offset(committed_raw) {
+                return Ok(CBlockState::NoEntry);
+            }
+
+            // means that there still have producers are allocating at this block.
+            // all consumer actions must execute after there have no executing actions of producer on this block.
+            if Cursor::offset(committed_raw) != self.size {
+                let allocated_raw = self.allocated_cursor.as_raw();
+                if Cursor::offset(allocated_raw) != Cursor::offset(committed_raw) {
+                    return Ok(CBlockState::NotAvailable);
+                }
+            }
+
+            // return the reserved index when it success reserved an entry.
+            if self.reserved_cursor.fetch_max(reserved_raw + 1) == reserved_raw {
+                let entry = self.consume_entry_unchecked(Cursor::offset(reserved_raw))?;
+                return Ok(CBlockState::Consumed(entry));
+            }
+        }
+    }
+
+    fn consume_entry_unchecked(&self, entry_offset: usize) -> Result<T> {
+        let layout = Layout::new::<T>();
+        let entry_ptr = Global.allocate(layout)?.cast::<T>();
+        unsafe {
+            self.entries
+                .as_ptr()
+                .add(entry_offset)
+                .copy_to(entry_ptr.as_ptr(), 1);
+            let entry = entry_ptr.as_uninit_mut().assume_init_read();
+
+            return Ok(entry);
+        }
     }
 }
 
@@ -81,7 +157,6 @@ impl<T> Drop for Block<T> {
 
 /// The cursor inside is a usize, indicating version + offset,
 /// with the version being stored in the first two bits.
-#[derive(Debug)]
 struct Cursor {
     inner: AtomicUsize,
 }
@@ -102,6 +177,13 @@ impl Cursor {
             .fetch_max(raw_val, std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn fetch_add_offset(&self, count: usize) -> usize {
+        let raw = self
+            .inner
+            .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+        Cursor::offset(raw)
+    }
+
     fn as_raw(&self) -> usize {
         self.inner.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -117,10 +199,23 @@ impl Cursor {
     }
 }
 
+impl Debug for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let raw = self.as_raw();
+        f.write_str("{ \n")?;
+        f.write_fmt(format_args!("    offset: {}\n", Cursor::offset(raw)))?;
+        f.write_fmt(format_args!("    vsn: {}\n", Cursor::vsn(raw)))?;
+        f.write_str("}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Bbq<T> {
     inner: Arc<BBQInner<T>>,
 }
+
+unsafe impl<T> Send for Bbq<T> where T: Send {}
+unsafe impl<T> Sync for Bbq<T> where T: Sync {}
 
 impl<T> Deref for Bbq<T> {
     type Target = BBQInner<T>;
@@ -134,7 +229,7 @@ impl<T> Deref for Bbq<T> {
 pub struct BBQInner<T> {
     blocks: NonNull<Block<T>>,
     phead_idx: AtomicUsize,
-    _chead_idx: AtomicUsize,
+    chead_idx: AtomicUsize,
     blocks_num: usize,
 }
 
@@ -165,41 +260,68 @@ impl<T> Bbq<T> {
             inner: Arc::new(BBQInner {
                 blocks,
                 phead_idx: AtomicUsize::new(0),
-                _chead_idx: AtomicUsize::new(0),
+                chead_idx: AtomicUsize::new(0),
                 blocks_num,
             }),
         })
     }
 
-    fn get_p_head_block(&self) -> Result<(usize, &Block<T>)> {
-        let phead_block_idx = self.phead_idx.load(std::sync::atomic::Ordering::SeqCst);
-        let phead_block_ref = unsafe {
-            self.blocks
-                .as_ptr()
-                .add(self.phead_idx.load(std::sync::atomic::Ordering::SeqCst) % self.blocks_num)
-                .as_ref()
-                .context("ptr is null.")?
-        };
+    fn get_phead_and_block(&self) -> Result<(usize, &Block<T>)> {
+        let phead_block_idx =
+            self.phead_idx.load(std::sync::atomic::Ordering::SeqCst) % self.blocks_num;
+        let phead_block_ref = unsafe { self.get_block_by_idx(phead_block_idx)? };
         Ok((phead_block_idx, phead_block_ref))
     }
 
-    pub fn enqueue(&self, item: T) -> Result<QueueState<T>> {
+    fn get_chead_and_block(&self) -> Result<(usize, &Block<T>)> {
+        let chead_block_idx =
+            self.chead_idx.load(std::sync::atomic::Ordering::SeqCst) % self.blocks_num;
+        let chead_block_ref = unsafe { self.get_block_by_idx(chead_block_idx)? };
+        Ok((chead_block_idx, chead_block_ref))
+    }
+
+    unsafe fn get_block_by_idx(&self, block_idx: usize) -> Result<&Block<T>> {
+        self.blocks
+            .as_ptr()
+            .add(block_idx)
+            .as_ref()
+            .context("block ptr is null.")
+    }
+
+    fn enqueue(&self, item: T) -> Result<EnqueueState<T>> {
         loop {
-            let (phead_block_idx, phead_block) = self.get_p_head_block()?;
+            let (phead_block_idx, phead_block) = self.get_phead_and_block()?;
             if let Some(entry_mut_ref) = phead_block.allocate_entry()? {
                 *entry_mut_ref = item;
-                return Ok(QueueState::Available);
+                phead_block.committed_cursor.fetch_add_offset(1);
+                return Ok(EnqueueState::Available);
             } else {
                 match self.advance_phead(phead_block_idx)? {
-                    BlockState::NoEntry => return Ok(QueueState::Busy(item)),
-                    BlockState::NotAvailable => return Ok(QueueState::Full(item)),
-                    BlockState::Available => continue,
+                    PBlockState::NoEntry => return Ok(EnqueueState::Busy(item)),
+                    PBlockState::NotAvailable => return Ok(EnqueueState::Full(item)),
+                    PBlockState::Available => continue,
                 }
             }
         }
     }
 
-    fn advance_phead(&self, phead_idx: usize) -> Result<BlockState> {
+    fn dequeue(&self) -> Result<DequeueState<T>> {
+        loop {
+            let (chead_idx, chead_block) = self.get_chead_and_block()?;
+            match chead_block.try_consume_entry()? {
+                CBlockState::Consumed(entry) => return Ok(DequeueState::Ok(entry)),
+                CBlockState::NoEntry => return Ok(DequeueState::Empty),
+                CBlockState::NotAvailable => return Ok(DequeueState::Busy),
+                CBlockState::BlockDone => {
+                    if !self.advance_chead(chead_idx)? {
+                        return Ok(DequeueState::Empty);
+                    }
+                }
+            }
+        }
+    }
+
+    fn advance_phead(&self, phead_idx: usize) -> Result<PBlockState> {
         let phead_block = unsafe {
             self.blocks
                 .as_ptr()
@@ -219,9 +341,9 @@ impl<T> Bbq<T> {
             let reserved_raw = phead_block.reserved_cursor.as_raw();
             let reserved_offset = Cursor::offset(reserved_raw);
             if reserved_offset == consumed_offset {
-                return Ok(BlockState::NoEntry);
+                return Ok(PBlockState::NoEntry);
             } else {
-                return Ok(BlockState::NotAvailable);
+                return Ok(PBlockState::NotAvailable);
             }
         }
 
@@ -234,7 +356,35 @@ impl<T> Bbq<T> {
         self.phead_idx
             .fetch_max(phead_idx + 1, std::sync::atomic::Ordering::SeqCst);
 
-        Ok(BlockState::Available)
+        Ok(PBlockState::Available)
+    }
+
+    fn advance_chead(&self, chead_idx: usize) -> Result<bool> {
+        let chead_block = unsafe {
+            self.blocks
+                .as_ptr()
+                .add((chead_idx + 1) % self.blocks_num)
+                .as_ref()
+                .context("ptr is null.")
+        }?;
+
+        let chead_vsn = Cursor::vsn(chead_block.consumed_cursor.as_raw());
+        let committed_raw = chead_block.committed_cursor.as_raw();
+
+        if Cursor::vsn(committed_raw) != chead_vsn + 1 {
+            return Ok(false);
+        }
+
+        chead_block
+            .consumed_cursor
+            .fetch_max(Cursor::new_raw(0, chead_vsn + 1));
+        chead_block
+            .reserved_cursor
+            .fetch_max(Cursor::new_raw(0, chead_vsn + 1));
+        self.chead_idx
+            .fetch_max(chead_idx + 1, std::sync::atomic::Ordering::SeqCst);
+
+        Ok(true)
     }
 }
 
@@ -243,10 +393,10 @@ pub trait BlockingQueue {
 
     fn push(&self, item: Self::Item) -> Result<()>;
 
-    fn pop(&self) -> Self::Item;
+    fn pop(&self) -> Result<Self::Item>;
 }
 
-const SLEEP_MILLES: u64 = 1000;
+const SLEEP_MILLES: u64 = 10;
 
 impl<T> BlockingQueue for Bbq<T> {
     type Item = T;
@@ -255,22 +405,32 @@ impl<T> BlockingQueue for Bbq<T> {
         let mut item = item;
         loop {
             match self.enqueue(item)? {
-                QueueState::Full(it) => item = it,
-                QueueState::Busy(it) => item = it,
-                QueueState::Available => return Ok(()),
+                EnqueueState::Full(it) => item = it,
+                EnqueueState::Busy(it) => item = it,
+                EnqueueState::Available => return Ok(()),
             }
             // yield thread, stop wasting cpu
             sleep(Duration::from_millis(SLEEP_MILLES));
         }
     }
 
-    fn pop(&self) -> Self::Item {
-        todo!()
+    fn pop(&self) -> Result<Self::Item> {
+        loop {
+            match self.dequeue()? {
+                DequeueState::Ok(item) => return Ok(item),
+                _ => {}
+            }
+
+            // yield thread, stop wasting cpu
+            sleep(Duration::from_millis(SLEEP_MILLES));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use crate::{Bbq, BlockingQueue, Cursor};
 
     #[test]
@@ -295,5 +455,26 @@ mod tests {
         let bbq = Bbq::<u64>::new(1, 5).unwrap();
         bbq.push(11).unwrap();
         bbq.push(12).unwrap();
+    }
+
+    #[test]
+    fn test_push_pop_concurrent() {
+        let bbq = Bbq::<u64>::new(2000, 2000).unwrap();
+        let bbq_clone = bbq.clone();
+
+        let handle_1 = thread::spawn(move || {
+            for i in 0..40000 {
+                bbq.push(i).unwrap();
+            }
+        });
+
+        let handle_2 = thread::spawn(move || {
+            for _ in 0..40000 {
+                bbq_clone.pop().unwrap();
+            }
+        });
+
+        handle_1.join().unwrap();
+        handle_2.join().unwrap();
     }
 }

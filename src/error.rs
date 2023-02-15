@@ -6,21 +6,8 @@ use std::{
 
 use anyhow::anyhow;
 
-pub enum QueueState<T> {
-    Full(T),
-    Busy(T),
-    Available,
-}
-
-pub enum BlockState {
-    Available,
-    NoEntry,
-    NotAvailable,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorKind {
-    BlockDone,
     Empty,
     Memory,
 }
