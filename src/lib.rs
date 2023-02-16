@@ -498,25 +498,25 @@ mod tests {
         let bbq_4 = bbq_1.clone();
 
         let handle_1 = thread::spawn(move || {
-            for i in 0..2000 {
+            for i in 0..20_0000 {
                 bbq_1.push(i).unwrap();
             }
         });
 
         let handle_2 = thread::spawn(move || {
-            for i in 0..2000 {
+            for i in 0..20_0000 {
                 bbq_2.push(i).unwrap();
             }
         });
 
         let handle_3 = thread::spawn(move || {
-            for _ in 0..2000 {
+            for _ in 0..20_0000 {
                 bbq_3.pop().unwrap();
             }
         });
 
         let handle_4 = thread::spawn(move || {
-            for _ in 0..2000 {
+            for _ in 0..20_0000 {
                 bbq_4.pop().unwrap();
             }
         });
