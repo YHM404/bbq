@@ -151,7 +151,7 @@ impl<T> Block<T> {
             .copy_to(entry_ptr.as_ptr(), 1);
         let entry = entry_ptr.as_uninit_mut().assume_init_read();
 
-        return Ok(entry);
+        Ok(entry)
     }
 }
 
@@ -274,15 +274,13 @@ impl<T> Bbq<T> {
 
         unsafe {
             blocks.as_ptr().add(0).write(Block::init(block_size, 0)?);
-            (1..blocks_num)
-                .map(|offset| {
-                    blocks
-                        .as_ptr()
-                        .add(offset)
-                        .write(Block::init(block_size, block_size)?);
-                    Ok(())
-                })
-                .collect::<Result<_>>()?;
+            (1..blocks_num).try_for_each(|offset| {
+                blocks
+                    .as_ptr()
+                    .add(offset)
+                    .write(Block::init(block_size, block_size)?);
+                Result::Ok(())
+            })?;
         }
 
         Ok(Self {
@@ -435,11 +433,9 @@ impl<T> BlockingQueue for Bbq<T> {
     /// Blocking until get a item from this queue.
     fn pop(&self) -> Result<Self::Item> {
         loop {
-            match self.dequeue()? {
-                DequeueState::Ok(item) => return Ok(item),
-                _ => {}
+            if let DequeueState::Ok(item) = self.dequeue()? {
+                return Ok(item);
             }
-
             // yield thread, stop wasting cpu
             sleep(Duration::from_millis(SLEEP_MILLES));
         }
