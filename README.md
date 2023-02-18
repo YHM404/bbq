@@ -18,21 +18,21 @@ use crate::bbq::Bbq;
 use crate::bbq::BlockingQueue;  
   
 fn main() {  
-	let queue = Bbq::new(100, 100).unwrap();  
+    let queue = Bbq::new(100, 100).unwrap();  
   
-	// Create four producer threads  
-	for i in 0..4 {  
-		let q = queue.clone();  
-		std::thread::spawn(move || {  
-		q.push(i);  
-	});
+    // Create four producer threads  
+    for i in 0..4 {  
+        let q = queue.clone();  
+        std::thread::spawn(move || {  
+        q.push(i);  
+    });
 
-	// Create four consumer threads  
-	for _ in 0..4 {  
-		let q = queue.clone();  
-		std::thread::spawn(move || {  
-			println!("{}", q.pop().unwrap());  
-		});  
-	}
+    // Create four consumer threads  
+    for _ in 0..4 {  
+        let q = queue.clone();  
+        std::thread::spawn(move || {  
+            println!("{}", q.pop().unwrap());  
+        });  
+    }
 }
 ```
