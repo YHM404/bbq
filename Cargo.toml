@@ -1,5 +1,5 @@
 [package]
-name = "bbq"
+name = "bbq-rs"
 authors = ["YHM404 <yaohuiming789@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
