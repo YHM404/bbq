@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-const VSN_BIT_LEN: usize = 16;
+const VSN_BIT_LEN: usize = 32;
 const OFFSET_BIT_LEN: usize = usize::BITS as usize - VSN_BIT_LEN;
 
 enum EnqueueState<T> {
@@ -353,30 +353,27 @@ impl<T> Bbq<T> {
 
         let phead_vsn = Cursor::vsn(phead_block.committed_cursor.as_raw());
         let nblk_consumed_raw = phead_next_block.consumed_cursor.as_raw();
-
-        // let nblk_consumed_vsn = Cursor::vsn(nblk_consumed_raw);
         let nblk_consumed_offset = Cursor::offset(nblk_consumed_raw);
 
-        // 如果下一个block
-        if nblk_consumed_offset != phead_next_block.size {
-            let reserved_raw = phead_next_block.reserved_cursor.as_raw();
-            let reserved_offset = Cursor::offset(reserved_raw);
-            if reserved_offset == nblk_consumed_offset {
+        if nblk_consumed_offset == phead_next_block.size {
+            phead_next_block
+                .committed_cursor
+                .fetch_max(Cursor::new_raw(0, phead_vsn + 1));
+            phead_next_block
+                .allocated_cursor
+                .fetch_max(Cursor::new_raw(0, phead_vsn + 1));
+            self.phead_idx
+                .fetch_max(phead_idx + 1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(PBlockState::Available);
+        } else {
+            let nblk_reserved_raw = phead_next_block.reserved_cursor.as_raw();
+            let nblk_reserved_offset = Cursor::offset(nblk_reserved_raw);
+            if nblk_reserved_offset == nblk_consumed_offset {
                 return Ok(PBlockState::NoEntry);
             } else {
                 return Ok(PBlockState::NotAvailable);
             }
         }
-
-        phead_next_block
-            .committed_cursor
-            .fetch_max(Cursor::new_raw(0, phead_vsn + 1));
-        phead_next_block
-            .allocated_cursor
-            .fetch_max(Cursor::new_raw(0, phead_vsn + 1));
-        self.phead_idx
-            .fetch_max(phead_idx + 1, std::sync::atomic::Ordering::SeqCst);
-        Ok(PBlockState::Available)
     }
 
     fn advance_chead(&self, chead_idx: usize) -> Result<bool> {
@@ -386,6 +383,8 @@ impl<T> Bbq<T> {
         let chead_vsn = Cursor::vsn(chead_block.consumed_cursor.as_raw());
         let nblk_committed_vsn = Cursor::vsn(chead_next_block.committed_cursor.as_raw());
 
+        // producer haven't produce on next block.
+        // The logic is still right if cancel this check, but maybe causing more competition with producers?
         if nblk_committed_vsn < chead_vsn + 1 {
             return Ok(false);
         }
@@ -488,32 +487,46 @@ mod tests {
 
     #[test]
     fn test_push_pop_concurrent() {
-        let bbq_1 = Bbq::<u64>::new(10, 100).unwrap();
+        let bbq_1 = Bbq::<u64>::new(100000, 100000).unwrap();
         let bbq_2 = bbq_1.clone();
         let bbq_3 = bbq_1.clone();
         let bbq_4 = bbq_1.clone();
+        let bbq_5 = bbq_1.clone();
+        let bbq_6 = bbq_1.clone();
 
         let handle_1 = thread::spawn(move || {
-            for i in 0..20_0000 {
+            for i in 0..20_000000 {
                 bbq_1.push(i).unwrap();
             }
         });
 
         let handle_2 = thread::spawn(move || {
-            for i in 0..20_0000 {
+            for i in 0..20_000000 {
                 bbq_2.push(i).unwrap();
             }
         });
 
         let handle_3 = thread::spawn(move || {
-            for _ in 0..20_0000 {
-                bbq_3.pop().unwrap();
+            for i in 0..20_000000 {
+                bbq_3.push(i).unwrap();
             }
         });
 
         let handle_4 = thread::spawn(move || {
-            for _ in 0..20_0000 {
+            for _ in 0..20_000000 {
                 bbq_4.pop().unwrap();
+            }
+        });
+
+        let handle_5 = thread::spawn(move || {
+            for _ in 0..20_000000 {
+                bbq_5.pop().unwrap();
+            }
+        });
+
+        let handle_6 = thread::spawn(move || {
+            for _ in 0..20_000000 {
+                bbq_6.pop().unwrap();
             }
         });
 
@@ -521,5 +534,7 @@ mod tests {
         handle_2.join().unwrap();
         handle_3.join().unwrap();
         handle_4.join().unwrap();
+        handle_5.join().unwrap();
+        handle_6.join().unwrap();
     }
 }
