@@ -14,8 +14,8 @@ bbq = "0.1.0"
 ## Example:
 
 ```rust
-use crate::bbq::Bbq;  
-use crate::bbq::BlockingQueue;  
+use bbq_rs::Bbq;  
+use bbq_rs::BlockingQueue;  
   
 fn main() {  
     let queue = Bbq::new(100, 100).unwrap();  
