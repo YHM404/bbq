@@ -4,11 +4,11 @@ This is a concurrent queue that supports multiple producers and multiple consume
 
 ## Usage
 
-Add `bbq` to your `Cargo.toml` dependencies:
+Add `bbq-rs` to your `Cargo.toml` dependencies:
 
 ```toml
 [dependencies]
-bbq = "0.1.0"
+bbq-rs = "0.1.0"
 ``` 
 
 ## Example:
