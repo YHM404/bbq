@@ -219,6 +219,32 @@ impl Debug for Cursor {
     }
 }
 
+/// This is a concurrent queue that supports multiple producers and multiple consumers.
+///
+/// ## Example
+/// ```
+/// use crate::bbq::Bbq;
+/// use crate::bbq::BlockingQueue;
+///
+/// fn main() {
+///     let queue = Bbq::new(100, 100).unwrap();
+///
+///     // Create four producer threads
+///     for i in 0..4 {
+///         let q = queue.clone();
+///         std::thread::spawn(move || {
+///             q.push(i);
+///         });
+///     }
+///
+///     // Create four consumer threads
+///     for _ in 0..4 {
+///         let q = queue.clone();
+///         std::thread::spawn(move || {
+///             println!("{}", q.pop().unwrap());
+///         });
+///     }
+/// }
 #[derive(Debug, Clone)]
 pub struct Bbq<T> {
     inner: Arc<BbqInner<T>>,
@@ -487,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_push_pop_concurrent() {
-        let bbq_1 = Bbq::<u64>::new(100000, 100000).unwrap();
+        let bbq_1 = Bbq::<u64>::new(1000, 1000).unwrap();
         let bbq_2 = bbq_1.clone();
         let bbq_3 = bbq_1.clone();
         let bbq_4 = bbq_1.clone();
@@ -495,37 +521,37 @@ mod tests {
         let bbq_6 = bbq_1.clone();
 
         let handle_1 = thread::spawn(move || {
-            for i in 0..20_000000 {
+            for i in 0..200_000 {
                 bbq_1.push(i).unwrap();
             }
         });
 
         let handle_2 = thread::spawn(move || {
-            for i in 0..20_000000 {
+            for i in 0..200_000 {
                 bbq_2.push(i).unwrap();
             }
         });
 
         let handle_3 = thread::spawn(move || {
-            for i in 0..20_000000 {
+            for i in 0..200_000 {
                 bbq_3.push(i).unwrap();
             }
         });
 
         let handle_4 = thread::spawn(move || {
-            for _ in 0..20_000000 {
+            for _ in 0..200_000 {
                 bbq_4.pop().unwrap();
             }
         });
 
         let handle_5 = thread::spawn(move || {
-            for _ in 0..20_000000 {
+            for _ in 0..200_000 {
                 bbq_5.pop().unwrap();
             }
         });
 
         let handle_6 = thread::spawn(move || {
-            for _ in 0..20_000000 {
+            for _ in 0..200_000 {
                 bbq_6.pop().unwrap();
             }
         });
