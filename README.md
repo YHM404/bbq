@@ -6,14 +6,14 @@ This is a concurrent queue that supports multiple producers and multiple consume
 
 Add `bbq` to your `Cargo.toml` dependencies:
 
-```
+```toml
 [dependencies]
 bbq = "0.1.0"
 ``` 
 
 ## Example:
 
-```
+```rust
 use crate::bbq::Bbq;  
 use crate::bbq::BlockingQueue;  
   
